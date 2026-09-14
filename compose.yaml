@@ -1,0 +1,22 @@
+name: relay
+
+services:
+  relay:
+    build:
+      context: .
+      target: relay
+    restart: unless-stopped
+    environment:
+      RELAY_DB_PATH: /var/lib/relay-api/relay.db
+      RELAY_BIND_HOST: 127.0.0.1
+      RELAY_BIND_PORT: 18777
+      RELAY_ALLOWED_ORIGIN: ${RELAY_ALLOWED_ORIGIN:-http://localhost:8080}
+      RELAY_SECURE_COOKIE: ${RELAY_SECURE_COOKIE:-0}
+    volumes:
+      - relay-state:/var/lib/relay-api
+    stop_grace_period: 70s
+    ports:
+      - "${RELAY_HTTP_BIND:-127.0.0.1}:${RELAY_HTTP_PORT:-8080}:8080"
+
+volumes:
+  relay-state:
