@@ -68,7 +68,8 @@ import { Textarea } from '@/components/ui/textarea';
 
 const API_BASE = '/relay/api';
 
-type TaskStatus = 'transferring' | 'queued' | 'completed' | 'failed' | 'paused';
+type TransferMode = 'public' | 'private' | 'local';
+type TaskStatus = 'transferring' | 'queued' | 'completed' | 'failed' | 'paused' | 'pausing' | 'cancelling' | 'cancelled';
 type TaskNodeDetails = { name: string; host: string; ssh_port: number; transfer_host?: string | null; transfer_port?: number | null };
 type Task = {
   id: string;
@@ -98,6 +99,7 @@ type Task = {
   scheduled?: boolean;
   source_node?: TaskNodeDetails | null;
   destination_node?: TaskNodeDetails | null;
+  transfer_mode?: TransferMode | 'legacy';
   direct_host?: string | null;
   direct_port?: number | null;
   verify_after_transfer?: boolean;
@@ -108,6 +110,7 @@ type Task = {
 };
 
 type NewTaskPayload = {
+  transfer_mode: TransferMode;
   name: string;
   source_node_id: string;
   source_path: string;
@@ -163,8 +166,8 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 function statusLabel(status: TaskStatus, scheduled = false, verificationStatus?: Task['verification_status']) {
   if (scheduled) return '已预约';
-  if (verificationStatus === 'running') return '校验中';
-  return { transferring: '传输中', queued: '等待执行', completed: '已完成', failed: '失败', paused: '已暂停' }[status];
+  if (status === 'transferring' && verificationStatus === 'running') return '校验中';
+  return { transferring: '传输中', queued: '等待执行', completed: '已完成', failed: '失败', paused: '已暂停', pausing: '暂停中', cancelling: '取消中', cancelled: '已取消' }[status];
 }
 
 function displayTime(value?: string | null) {
@@ -188,7 +191,7 @@ function scheduleLabel(task: Task) {
 }
 
 function statusClass(status: TaskStatus) {
-  return { transferring: 'status-live', queued: 'status-queued', completed: 'status-complete', failed: 'status-failed', paused: 'status-paused' }[status];
+  return { transferring: 'status-live', queued: 'status-queued', completed: 'status-complete', failed: 'status-failed', paused: 'status-paused', pausing: 'status-queued', cancelling: 'status-queued', cancelled: 'status-paused' }[status];
 }
 
 function sizeLimitLabel(value?: number | null) {
@@ -269,100 +272,101 @@ function ServiceUnavailable({ message, onRetry }: { message: string; onRetry: ()
   return <main className="status-screen"><div className="status-card"><div className="status-icon failed"><AlertCircle /></div><h1>控制服务暂时不可用</h1><p>{message}</p><Button onClick={onRetry}><RefreshCw />重新连接</Button></div></main>;
 }
 
+function transferModeLabel(mode?: Task['transfer_mode']) {
+  return ({ public: '公网传输', private: '内网传输', local: '同节点传输', legacy: '历史自定义地址' })[mode || 'public'];
+}
+
 function NewTransferDialog({ nodes, onCreate }: { nodes: Node[]; onCreate: (payload: NewTaskPayload) => Promise<void> }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState('');
+  const [mode, setMode] = useState<TransferMode>('public');
   const [sourceNodeId, setSourceNodeId] = useState('');
   const [destinationNodeId, setDestinationNodeId] = useState('');
   const [sourcePath, setSourcePath] = useState('');
   const [destinationPath, setDestinationPath] = useState('');
   const [bandwidthLimit, setBandwidthLimit] = useState('0');
   const [sizeLimit, setSizeLimit] = useState('100');
-  const [deleteEnabled, setDeleteEnabled] = useState(false);
   const [scheduleAt, setScheduleAt] = useState('');
   const [directHost, setDirectHost] = useState('');
-  const [directPort, setDirectPort] = useState('');
+  const [directPort, setDirectPort] = useState('22');
   const [verifyAfterTransfer, setVerifyAfterTransfer] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const onlineNodes = useMemo(() => nodes.filter((node) => node.status === 'online'), [nodes]);
+  const local = mode === 'local';
+  const destinationNode = nodes.find((node) => node.id === destinationNodeId);
+  const ready = !!sourceNodeId && !!sourcePath.trim() && !!destinationPath.trim() && !!sizeLimit.trim()
+    && (local || (!!destinationNodeId && sourceNodeId !== destinationNodeId))
+    && (mode !== 'private' || (!!directHost.trim() && Number(directPort) >= 1 && Number(directPort) <= 65535));
+  const finalPath = destinationPath.trim() && sourcePath.trim()
+    ? `${destinationPath.trim().replace(/\/+$/, '')}/${sourcePath.trim().replace(/\/+$/, '').split('/').pop()}` : '';
 
   useEffect(() => {
-    if (!open || onlineNodes.length < 2) return;
-    const validSource = onlineNodes.some((node) => node.id === sourceNodeId) ? sourceNodeId : onlineNodes[0].id;
-    const validDestination = onlineNodes.some((node) => node.id === destinationNodeId && node.id !== validSource)
-      ? destinationNodeId
-      : onlineNodes.find((node) => node.id !== validSource)?.id || '';
-    if (sourceNodeId !== validSource) setSourceNodeId(validSource);
-    if (destinationNodeId !== validDestination) setDestinationNodeId(validDestination);
+    if (!open || !onlineNodes.length) return;
+    const source = onlineNodes.some((node) => node.id === sourceNodeId) ? sourceNodeId : onlineNodes[0].id;
+    const destination = onlineNodes.some((node) => node.id === destinationNodeId && node.id !== source)
+      ? destinationNodeId : onlineNodes.find((node) => node.id !== source)?.id || '';
+    if (sourceNodeId !== source) setSourceNodeId(source);
+    if (destinationNodeId !== destination) setDestinationNodeId(destination);
   }, [open, onlineNodes, sourceNodeId, destinationNodeId]);
 
-  function chooseSourceNode(nextId: string) {
-    setSourceNodeId(nextId);
-    if (nextId === destinationNodeId) setDestinationNodeId(onlineNodes.find((node) => node.id !== nextId)?.id || '');
-  }
-
-  function chooseDestinationNode(nextId: string) {
-    setDestinationNodeId(nextId);
-    if (nextId === sourceNodeId) setSourceNodeId(onlineNodes.find((node) => node.id !== nextId)?.id || '');
+  function changeMode(next: TransferMode) {
+    if ((mode === 'local') !== (next === 'local')) setDestinationPath('');
+    setMode(next); setDirectHost(''); setDirectPort('22'); setError('');
   }
 
   async function createTask() {
-    if (!sourceNodeId || !destinationNodeId || !sourcePath || !destinationPath || !sizeLimit.trim() || sourceNodeId === destinationNodeId) return;
+    if (!ready || submitting) return;
     setSubmitting(true); setError('');
     try {
       await onCreate({
-        name,
-        source_node_id: sourceNodeId,
-        source_path: sourcePath,
-        destination_node_id: destinationNodeId,
-        destination_path: destinationPath,
-        bandwidth_limit_mbps: Number(bandwidthLimit || 0),
-        max_size_gb: Number(sizeLimit),
-        delete_enabled: deleteEnabled,
+        name, transfer_mode: mode,
+        source_node_id: sourceNodeId, source_path: sourcePath,
+        destination_node_id: local ? sourceNodeId : destinationNodeId, destination_path: destinationPath,
+        bandwidth_limit_mbps: Number(bandwidthLimit || 0), max_size_gb: Number(sizeLimit),
+        delete_enabled: false,
         schedule_at: scheduleAt ? new Date(scheduleAt).toISOString() : '',
-        direct_host: directHost,
-        direct_port: directPort.trim() ? Number(directPort) : undefined,
+        ...(mode === 'private' ? { direct_host: directHost.trim(), direct_port: Number(directPort) } : {}),
         verify_after_transfer: verifyAfterTransfer,
       });
-      setName(''); setSourcePath(''); setDestinationPath(''); setSizeLimit('100'); setDeleteEnabled(false); setVerifyAfterTransfer(false); setScheduleAt(''); setDirectHost(''); setDirectPort(''); setOpen(false);
+      setName(''); setSourcePath(''); setDestinationPath(''); setSizeLimit('100');
+      setVerifyAfterTransfer(false); setScheduleAt(''); setDirectHost(''); setDirectPort('22'); setOpen(false);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '创建失败');
-    } finally {
-      setSubmitting(false);
-    }
+    } finally { setSubmitting(false); }
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger disabled={onlineNodes.length < 2} render={<Button className="new-task-button" title={onlineNodes.length < 2 ? '至少需要两台在线节点' : undefined}><Plus />新建传输</Button>} />
+    <Dialog open={open} onOpenChange={(next) => { if (!submitting) setOpen(next); }}>
+      <DialogTrigger disabled={!onlineNodes.length} render={<Button className="new-task-button" title={!onlineNodes.length ? '至少需要一台在线节点' : undefined}><Plus />新建传输</Button>} />
       <DialogContent className="transfer-dialog direct-transfer-dialog">
-        <DialogHeader><div className="dialog-icon"><UploadCloud size={20} /></div><DialogTitle>新建节点直传任务</DialogTitle><DialogDescription>Relay 只下发任务和接收进度，文件或目录会从源节点直接流向目标节点。</DialogDescription></DialogHeader>
-        <div className="form-stack">
-          <label className="task-name-field" htmlFor="task-name" aria-label="任务名称"><span className="field-label"><strong>任务名称</strong><em>可选</em></span><Input id="task-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：media-archive-aug-31" /></label>
-          <div className="transfer-route">
-            <label className="route-source-node">源节点<NativeSelect className="node-native-select" value={sourceNodeId} onChange={(event) => chooseSourceNode(event.target.value)}>{onlineNodes.map((node) => <NativeSelectOption key={node.id} value={node.id} disabled={node.id === destinationNodeId}>{node.name} · {node.host}:{node.ssh_port}</NativeSelectOption>)}</NativeSelect></label>
+        <DialogHeader><div className="dialog-icon"><UploadCloud size={20} /></div><DialogTitle>新建传输任务</DialogTitle><DialogDescription>{local ? '在所选物理机内复制文件或目录，保留源文件。' : 'Relay 下发任务并接收进度，文件由源节点直接传到目标节点。'}</DialogDescription></DialogHeader>
+        <div className="form-stack" inert={submitting}>
+          <label className="task-name-field" htmlFor="task-name" aria-label="任务名称"><span className="field-label"><strong>任务名称</strong><em>可选</em></span><Input id="task-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：media-archive-sep-17" /></label>
+          <label>传输方式<NativeSelect className="node-native-select" aria-label="传输方式" value={mode} onChange={(event) => changeMode(event.target.value as TransferMode)}><NativeSelectOption value="public">公网传输</NativeSelectOption><NativeSelectOption value="private">内网传输</NativeSelectOption><NativeSelectOption value="local">同节点传输</NativeSelectOption></NativeSelect></label>
+          {!local && onlineNodes.length < 2 && <div className="path-hint">跨节点传输需要两台在线节点；同一台物理机内复制请选择“同节点传输”。</div>}
+          <div className={`transfer-route ${local ? 'local-transfer-route' : ''}`}>
+            <label className="route-source-node">{local ? '执行节点' : '源节点'}<NativeSelect aria-label={local ? '执行节点' : '源节点'} className="node-native-select" value={sourceNodeId} onChange={(event) => setSourceNodeId(event.target.value)}>{onlineNodes.map((node) => <NativeSelectOption key={node.id} value={node.id}>{node.name} · {node.host}:{node.ssh_port}</NativeSelectOption>)}</NativeSelect></label>
+            {!local && <label className="route-destination-node">目标节点<NativeSelect aria-label="目标节点" className="node-native-select" value={destinationNodeId} onChange={(event) => { setDestinationNodeId(event.target.value); setDirectHost(''); setDirectPort('22'); }}><NativeSelectOption value="" disabled>请选择目标节点</NativeSelectOption>{onlineNodes.filter((node) => node.id !== sourceNodeId).map((node) => <NativeSelectOption key={node.id} value={node.id}>{node.name} · {node.host}:{node.ssh_port}</NativeSelectOption>)}</NativeSelect></label>}
             <label className="route-source-path">源路径<span>可填写单个文件或目录</span><Input value={sourcePath} onChange={(event) => setSourcePath(event.target.value)} placeholder="/mnt/data/report.zip 或 /mnt/data/source/" /></label>
-            <Button type="button" variant="outline" size="icon" className="swap-route" aria-label="交换源节点和目标节点" onClick={() => { setSourceNodeId(destinationNodeId); setDestinationNodeId(sourceNodeId); setSourcePath(destinationPath); setDestinationPath(sourcePath); setDirectHost(''); setDirectPort(''); }}><ArrowRightLeft /></Button>
-            <label className="route-destination-node">目标节点<NativeSelect className="node-native-select" value={destinationNodeId} onChange={(event) => chooseDestinationNode(event.target.value)}>{onlineNodes.map((node) => <NativeSelectOption key={node.id} value={node.id} disabled={node.id === sourceNodeId}>{node.name} · {node.host}:{node.ssh_port}</NativeSelectOption>)}</NativeSelect></label>
-            <label className="route-destination-path">目标目录<span>写入已有目录</span><Input value={destinationPath} onChange={(event) => setDestinationPath(event.target.value)} placeholder="/mnt/data/archive/" /></label>
+            <label className="route-destination-path">目标目录<span>{local ? '同一物理机上的已有目录' : '目标节点上的已有目录'}</span><Input value={destinationPath} onChange={(event) => setDestinationPath(event.target.value)} placeholder="/mnt/data/archive/" /></label>
           </div>
-          <div className="transfer-options direct-route-options">
-            <label>本次直传目标 IP（可选）<span>同局域网时填写目标节点内网 IP；留空走公网</span><Input value={directHost} onChange={(event) => setDirectHost(event.target.value)} placeholder="例如：10.0.0.12" /></label>
-            <label>本次直传端口（可选）<span>默认使用目标节点的 SSH 端口</span><Input type="number" min="1" max="65535" value={directPort} onChange={(event) => setDirectPort(event.target.value)} placeholder="例如：22" /></label>
-          </div>
+          {mode === 'private' && <div className="transfer-options direct-route-options">
+            <label>目标内网 IP<span>由源节点连接；不可达时不会切换公网</span><Input aria-label="目标内网 IP" value={directHost} onChange={(event) => setDirectHost(event.target.value)} placeholder="例如：10.0.0.12" required /></label>
+            <label>目标 SSH 端口<span>填写内网实际端口，可能与公网端口不同</span><Input aria-label="目标 SSH 端口" type="number" min="1" max="65535" value={directPort} onChange={(event) => setDirectPort(event.target.value)} required /></label>
+          </div>}
+          {mode === 'public' && destinationNode && <div className="path-hint">本次公网连接：<strong>{destinationNode.host}:{destinationNode.ssh_port}</strong></div>}
           <div className="transfer-options">
-            <label>带宽上限<span>MB/s，0 表示不限速</span><Input type="number" min="0" max="10240" value={bandwidthLimit} onChange={(event) => setBandwidthLimit(event.target.value)} /></label>
+            <label>传输速度上限<span>MB/s，0 表示不限速</span><Input type="number" min="0" max="10240" value={bandwidthLimit} onChange={(event) => setBandwidthLimit(event.target.value)} /></label>
             <label>任务大小上限<span>GB，默认 100；0 表示不限</span><Input type="number" min="0" max="1048576" step="1" value={sizeLimit} onChange={(event) => setSizeLimit(event.target.value)} /></label>
-            <div className="switch-option"><div><strong>镜像删除（仅目录）</strong><span>删除目标中源目录没有的文件</span></div><Switch checked={deleteEnabled} onCheckedChange={setDeleteEnabled} /></div>
-            <div className="switch-option"><div><strong>传输后内容校验</strong><span>完成后逐文件读取两端内容；仅校验，不改动文件</span></div><Switch checked={verifyAfterTransfer} onCheckedChange={setVerifyAfterTransfer} /></div>
+            <div className="switch-option"><div><strong>传输后内容复检</strong><span>默认包含传输校验；开启后再逐文件读取并比较内容</span></div><Switch checked={verifyAfterTransfer} onCheckedChange={setVerifyAfterTransfer} /></div>
           </div>
-          <label>预约开始时间<span>留空则在目录和大小校验通过后立即传输</span><Input type="datetime-local" value={scheduleAt} onChange={(event) => setScheduleAt(event.target.value)} /></label>
-          <div className="path-hint">源路径可填单个文件或目录：单个文件会保留原文件名；目录以 <code>/</code> 结尾时传目录内容，不以 <code>/</code> 结尾时会保留源目录名。</div>
-          <div className="transport-note"><ShieldCheck size={16} /><span>每个任务使用短期受限密钥，目标节点只允许写入本次选择的目录。</span></div>
+          <label>预约开始时间<span>留空则在基础校验通过后立即执行</span><Input type="datetime-local" value={scheduleAt} onChange={(event) => setScheduleAt(event.target.value)} /></label>
+          <div className="path-hint">保留源文件和目录名；同名目录合并，需要更新的同名文件以源文件为准，保留目标独有文件。{finalPath && <><br />最终目标路径：<strong>{finalPath}</strong></>}</div>
+          <div className="transport-note"><ShieldCheck size={16} /><span>{local ? '两个路径都必须能在所选节点上访问。支持取消后重试并续传，已完成文件保留。' : '使用 SSH 加密直传并核对目标身份。支持取消后重试并续传，已完成文件保留。'}</span></div>
           {error && <div className="dialog-error"><AlertCircle />{error}</div>}
         </div>
-        <DialogFooter><Button variant="outline" onClick={() => setOpen(false)}>取消</Button><Button className="dialog-primary" onClick={createTask} disabled={!sourcePath || !destinationPath || !sizeLimit.trim() || sourceNodeId === destinationNodeId || submitting}>{submitting && <LoaderCircle className="spin" />}{submitting ? '正在校验...' : scheduleAt ? '校验并预约' : '校验并开始直传'}</Button></DialogFooter>
+        <DialogFooter><Button variant="outline" disabled={submitting} onClick={() => setOpen(false)}>取消</Button><Button className="dialog-primary" onClick={createTask} disabled={!ready || submitting}>{submitting && <LoaderCircle className="spin" />}{submitting ? '正在校验...' : scheduleAt ? '校验并预约' : '校验并开始'}</Button></DialogFooter>
       </DialogContent>
     </Dialog>
   );
@@ -605,7 +609,7 @@ function Dashboard({ user, onSignedOut }: { user: User; onSignedOut: () => void 
   }, [loadData]);
 
   const filteredTasks = useMemo(() => tasks.filter((task) => {
-    const matchesFilter = filter === '全部' || (filter === '进行中' && ['transferring', 'queued', 'paused'].includes(task.status)) || (filter === '已完成' && task.status === 'completed') || (filter === '失败' && task.status === 'failed');
+    const matchesFilter = filter === '全部' || (filter === '进行中' && ['transferring', 'queued', 'paused', 'pausing', 'cancelling'].includes(task.status)) || (filter === '已完成' && task.status === 'completed') || (filter === '失败' && task.status === 'failed');
     return matchesFilter && `${task.name} ${task.source} ${task.destination}`.toLowerCase().includes(query.toLowerCase());
   }), [filter, query, tasks]);
 
@@ -682,9 +686,11 @@ function Dashboard({ user, onSignedOut }: { user: User; onSignedOut: () => void 
     }
   }
 
-  async function taskAction(id: string, action: 'pause' | 'resume' | 'retry') {
-    const data = await api<{ task: Task }>(`/tasks/${id}/${action}`, { method: 'POST', body: '{}' });
-    setTasks((current) => current.map((task) => task.id === id ? data.task : task)); setSelectedId(id);
+  async function taskAction(id: string, action: 'pause' | 'resume' | 'retry' | 'cancel') {
+    try {
+      const data = await api<{ task: Task }>(`/tasks/${id}/${action}`, { method: 'POST', body: '{}' });
+      setTasks((current) => current.map((task) => task.id === id ? { ...task, ...data.task } : task)); setSelectedId(id);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '操作失败'); }
   }
 
   async function signOut() {
@@ -723,9 +729,9 @@ function Dashboard({ user, onSignedOut }: { user: User; onSignedOut: () => void 
           {error && <div className="dashboard-alert"><AlertCircle />{error}<button onClick={() => loadData()}>重试</button></div>}
           <section className="stat-grid" aria-label="传输概况"><div className="stat-card"><div className="stat-top"><span>进行中的任务</span><div className="stat-icon mint"><Activity size={17} /></div></div><strong>{activeCount}<small> 个任务</small></strong><div className="stat-foot neutral">队列中 <b>{queuedCount}</b></div></div><div className="stat-card"><div className="stat-top"><span>已完成任务</span><div className="stat-icon violet"><CheckCircle2 size={17} /></div></div><strong>{completedCount}<small> 个任务</small></strong><div className="stat-foot positive">成功率 <b>{successRate}%</b></div></div><div className="stat-card"><div className="stat-top"><span>在线传输节点</span><div className="stat-icon orange"><Gauge size={17} /></div></div><strong>{onlineNodes}<small> / {nodes.length || 0}</small></strong><div className="stat-foot neutral"><span className="line-icon" />至少两台在线可直传</div></div><div className="stat-card chart-card"><div className="stat-top"><span>吞吐量趋势</span><span className="stat-period">近 7 天</span></div><MiniChart hasData={completedCount > 0} /></div></section>
 
-          <section className="active-section"><div className="section-title-row"><div><h2>{selected ? '任务详情' : '开始使用'}</h2><span>{selected ? '所选任务的实时状态' : '添加两台节点后即可直传'}</span></div>{selected && <button className="text-button" onClick={() => { setFilter('全部'); setActiveNav('传输任务'); document.getElementById('tasks')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }}>查看全部 <ArrowUpRight size={14} /></button>}</div>{selected ? <div className="active-card"><div className="active-card-top"><div className="task-identity"><div className="task-icon live"><TaskIcon kind={selected.kind} /></div><div><div className="task-title-line"><h3>{selected.name}</h3><Badge className={statusClass(selected.status)}><span className="badge-dot" />{statusLabel(selected.status, selected.scheduled)}</Badge></div><p><span>{selected.source}</span><ArrowUpRight size={13} /><span>{selected.destination}</span></p></div></div><div className="active-actions">{['queued', 'transferring'].includes(selected.status) && <Button variant="outline" size="sm" onClick={() => taskAction(selected.id, 'pause')}><Pause />暂停</Button>}{selected.status === 'paused' && <Button variant="outline" size="sm" onClick={() => taskAction(selected.id, 'resume')}><Play />继续</Button>}{['failed', 'completed'].includes(selected.status) && <Button variant="outline" size="sm" onClick={() => taskAction(selected.id, 'retry')}><RefreshCw />{selected.status === 'completed' ? '再次传输' : '重试'}</Button>}{(selected.status !== 'transferring' && (selected.status !== 'queued' || selected.scheduled)) && <Button variant="ghost" size="sm" className="delete-task-button" onClick={() => setTaskToDelete(selected)}><Trash2 />删除</Button>}</div></div><div className="task-endpoints"><div><span>源端 · 发送方</span><strong>{selected.source_node?.name || '节点信息不可用'}</strong><small>管理地址：{selected.source_node ? `${selected.source_node.host}:${selected.source_node.ssh_port}` : '—'}</small><small>源路径：{selected.source_path || '—'}</small></div><ArrowRightLeft size={16} /><div><span>目标端 · 接收方</span><strong>{selected.destination_node?.name || '节点信息不可用'}</strong><small>管理地址：{selected.destination_node ? `${selected.destination_node.host}:${selected.destination_node.ssh_port}` : '—'}</small><small>{selected.direct_host ? `本次直传：${selected.direct_host}:${selected.direct_port}（内网）` : `本次直传：${selected.destination_node ? `${selected.destination_node.host}:${selected.destination_node.ssh_port}` : '—'}（公网）`}</small><small>目标路径：{selected.destination_path || '—'}</small></div></div>{selected.error && <div className="task-failure"><AlertCircle /><div><strong>失败原因</strong><p>{selected.error}</p></div></div>}<div className="progress-line"><div className="progress-label"><span>总进度 {selected.transferred} <b>/ {selected.size}</b></span><strong>{selected.progress}%</strong></div><Progress value={selected.progress} className="transfer-progress" /></div><div className="metric-row"><div><span>当前速度</span><strong>{selected.speed}</strong></div><div><span>预计剩余</span><strong>{selected.eta}</strong></div><div><span>大小上限</span><strong>{sizeLimitLabel(selected.max_size_bytes)}</strong></div><div><span>{selected.scheduled ? '预约时间（北京时间）' : '开始时间（北京时间）'}</span><strong>{scheduleLabel(selected)}</strong></div><div className="active-card-status"><span className="pulse-dot" />更新于 {displayTime(selected.updated)}（北京时间）</div></div>{selected.log && <div className="task-log"><div><TerminalSquare />传输日志</div><pre>{selected.log}</pre></div>}</div> : <div className="onboarding-card"><div className="onboarding-icon"><Network /></div><div><h3>节点直传执行器已经就绪</h3><p>添加至少两台在线节点，选择源节点、目标节点和路径后，文件将直接从源节点通过 rsync 传到目标节点。</p></div><div className="onboarding-steps"><span><b>1</b>添加节点</span><span><b>2</b>选择两端路径</span><span><b>3</b>开始直传</span></div></div>}</section>
+          <section className="active-section"><div className="section-title-row"><div><h2>{selected ? '任务详情' : '开始使用'}</h2><span>{selected ? '所选任务的实时状态' : '添加节点后即可创建传输任务'}</span></div>{selected && <button className="text-button" onClick={() => { setFilter('全部'); setActiveNav('传输任务'); document.getElementById('tasks')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }}>查看全部 <ArrowUpRight size={14} /></button>}</div>{selected ? <div className="active-card"><div className="active-card-top"><div className="task-identity"><div className="task-icon live"><TaskIcon kind={selected.kind} /></div><div><div className="task-title-line"><h3>{selected.name}</h3><Badge variant="outline">{transferModeLabel(selected.transfer_mode)}</Badge><Badge className={statusClass(selected.status)}><span className="badge-dot" />{statusLabel(selected.status, selected.scheduled)}</Badge></div><p><span>{selected.source}</span><ArrowUpRight size={13} /><span>{selected.destination}</span></p></div></div><div className="active-actions">{['queued', 'transferring'].includes(selected.status) && <Button variant="outline" size="sm" onClick={() => taskAction(selected.id, 'pause')}><Pause />暂停</Button>}{['queued', 'transferring', 'paused'].includes(selected.status) && <Button variant="outline" size="sm" onClick={() => taskAction(selected.id, 'cancel')}>取消任务</Button>}{selected.status === 'paused' && <Button variant="outline" size="sm" onClick={() => taskAction(selected.id, 'resume')}><Play />继续</Button>}{['failed', 'completed', 'cancelled'].includes(selected.status) && <Button variant="outline" size="sm" onClick={() => taskAction(selected.id, 'retry')}><RefreshCw />{selected.status === 'completed' ? '再次传输' : '重试'}</Button>}{(!['transferring', 'pausing', 'cancelling'].includes(selected.status) && (selected.status !== 'queued' || selected.scheduled)) && <Button variant="ghost" size="sm" className="delete-task-button" onClick={() => setTaskToDelete(selected)}><Trash2 />删除</Button>}</div></div><div className="task-endpoints"><div><span>源端 · 发送方</span><strong>{selected.source_node?.name || '节点信息不可用'}</strong><small>管理地址：{selected.source_node ? `${selected.source_node.host}:${selected.source_node.ssh_port}` : '—'}</small><small>源路径：{selected.source_path || '—'}</small></div><ArrowRightLeft size={16} /><div><span>目标端 · 接收方</span><strong>{selected.destination_node?.name || '节点信息不可用'}</strong><small>管理地址：{selected.destination_node ? `${selected.destination_node.host}:${selected.destination_node.ssh_port}` : '—'}</small><small>{selected.transfer_mode === 'local' ? '本次复制：同一物理机内执行' : `${transferModeLabel(selected.transfer_mode)}：${selected.direct_host || selected.destination_node?.host || '—'}:${selected.direct_port || selected.destination_node?.ssh_port || '—'}`}</small><small>目标路径：{selected.destination_path || '—'}</small></div></div>{selected.error && <div className="task-failure"><AlertCircle /><div><strong>失败原因</strong><p>{selected.error}</p></div></div>}<div className="progress-line"><div className="progress-label"><span>总进度 {selected.transferred} <b>/ {selected.size}</b></span><strong>{selected.progress}%</strong></div><Progress value={selected.progress} className="transfer-progress" /></div><div className="metric-row"><div><span>当前速度</span><strong>{selected.speed}</strong></div><div><span>预计剩余</span><strong>{selected.eta}</strong></div><div><span>大小上限</span><strong>{sizeLimitLabel(selected.max_size_bytes)}</strong></div><div><span>{selected.scheduled ? '预约时间（北京时间）' : '开始时间（北京时间）'}</span><strong>{scheduleLabel(selected)}</strong></div><div className="active-card-status"><span className="pulse-dot" />更新于 {displayTime(selected.updated)}（北京时间）</div></div>{selected.log && <div className="task-log"><div><TerminalSquare />传输日志</div><pre>{selected.log}</pre></div>}</div> : <div className="onboarding-card"><div className="onboarding-icon"><Network /></div><div><h3>节点直传执行器已经就绪</h3><p>添加在线节点后，可选择公网传输、内网传输，或同一物理机内复制。跨节点传输需要两台在线节点。</p></div><div className="onboarding-steps"><span><b>1</b>添加节点</span><span><b>2</b>选择两端路径</span><span><b>3</b>开始直传</span></div></div>}</section>
 
-          <section className="tasks-section" id="tasks"><div className="section-title-row"><div><h2>全部任务</h2><span>共 {tasks.length} 个传输任务{user.role === 'admin' ? ' · 管理员视图包含所有用户' : ''}</span></div></div><div className="table-toolbar"><div className="filter-tabs">{(['全部', '进行中', '已完成', '失败'] as const).map((item) => <button key={item} className={filter === item ? 'selected' : ''} onClick={() => setFilter(item)}>{item}{item === '进行中' && queuedCount > 0 && <span>{queuedCount + activeCount}</span>}</button>)}</div><label className="search-box"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索任务..." /></label></div><div className="task-table-wrap"><table className="task-table"><thead><tr><th>任务名称</th>{user.role === 'admin' && <th>发起人</th>}<th>状态</th><th>总进度</th><th>速度</th><th>更新时间（北京时间）</th><th aria-label="操作" /></tr></thead><tbody>{filteredTasks.map((task) => <tr key={task.id} className={selected?.id === task.id ? 'row-selected' : ''}><td><button type="button" className="table-task-select" aria-label={`查看任务 ${task.name}`} onClick={() => setSelectedId(task.id)}><div className="table-task"><div className={`task-icon small ${statusClass(task.status)}`}><TaskIcon kind={task.kind} /></div><div><strong>{task.name}</strong><span className={task.status === 'failed' && task.error ? 'failed-task-reason' : ''}>{task.status === 'failed' && task.error ? task.error : task.source}</span></div></div></button></td>{user.role === 'admin' && <td><span className="updated-cell">{task.owner_display_name || task.owner_username || '—'}</span></td>}<td><Badge className={statusClass(task.status)}><span className="badge-dot" />{statusLabel(task.status, task.scheduled)}</Badge></td><td><div className="table-progress"><div><span>{task.transferred}</span><span>{task.progress}%</span></div><Progress value={task.progress} className={`tiny-progress ${task.status === 'failed' ? 'failed-progress' : ''}`} /></div></td><td><span className="speed-cell">{task.speed}</span></td><td><span className="updated-cell">{displayTime(task.updated)}</span></td><td><div className="task-row-actions">{task.status === 'failed' && <Button variant="ghost" size="sm" className="retry-button" onClick={(event) => { event.stopPropagation(); void taskAction(task.id, 'retry'); }}><RefreshCw size={14} />重试</Button>}{task.status !== 'transferring' && (task.status !== 'queued' || task.scheduled) && <Button variant="ghost" size="icon-sm" className="delete-task-button" aria-label="删除任务" onClick={(event) => { event.stopPropagation(); setTaskToDelete(task); }}><Trash2 /></Button>}</div></td></tr>)}</tbody></table>{!loading && filteredTasks.length === 0 && <div className="empty-state"><Search size={20} /><span>{tasks.length ? '没有找到匹配的任务' : '还没有任务，点击“新建传输”开始'}</span></div>}{loading && <div className="empty-state"><LoaderCircle className="spin" /><span>正在读取任务...</span></div>}</div></section>
+          <section className="tasks-section" id="tasks"><div className="section-title-row"><div><h2>全部任务</h2><span>共 {tasks.length} 个传输任务{user.role === 'admin' ? ' · 管理员视图包含所有用户' : ''}</span></div></div><div className="table-toolbar"><div className="filter-tabs">{(['全部', '进行中', '已完成', '失败'] as const).map((item) => <button key={item} className={filter === item ? 'selected' : ''} onClick={() => setFilter(item)}>{item}{item === '进行中' && queuedCount > 0 && <span>{queuedCount + activeCount}</span>}</button>)}</div><label className="search-box"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索任务..." /></label></div><div className="task-table-wrap"><table className="task-table"><thead><tr><th>任务名称</th>{user.role === 'admin' && <th>发起人</th>}<th>状态</th><th>总进度</th><th>速度</th><th>更新时间（北京时间）</th><th aria-label="操作" /></tr></thead><tbody>{filteredTasks.map((task) => <tr key={task.id} className={selected?.id === task.id ? 'row-selected' : ''}><td><button type="button" className="table-task-select" aria-label={`查看任务 ${task.name}`} onClick={() => setSelectedId(task.id)}><div className="table-task"><div className={`task-icon small ${statusClass(task.status)}`}><TaskIcon kind={task.kind} /></div><div><strong>{task.name}</strong><span>{transferModeLabel(task.transfer_mode)}</span><span className={task.status === 'failed' && task.error ? 'failed-task-reason' : ''}>{task.status === 'failed' && task.error ? task.error : task.source}</span></div></div></button></td>{user.role === 'admin' && <td><span className="updated-cell">{task.owner_display_name || task.owner_username || '—'}</span></td>}<td><Badge className={statusClass(task.status)}><span className="badge-dot" />{statusLabel(task.status, task.scheduled)}</Badge></td><td><div className="table-progress"><div><span>{task.transferred}</span><span>{task.progress}%</span></div><Progress value={task.progress} className={`tiny-progress ${task.status === 'failed' ? 'failed-progress' : ''}`} /></div></td><td><span className="speed-cell">{task.speed}</span></td><td><span className="updated-cell">{displayTime(task.updated)}</span></td><td><div className="task-row-actions">{['failed', 'cancelled'].includes(task.status) && <Button variant="ghost" size="sm" className="retry-button" onClick={(event) => { event.stopPropagation(); void taskAction(task.id, 'retry'); }}><RefreshCw size={14} />重试</Button>}{!['transferring', 'pausing', 'cancelling'].includes(task.status) && (task.status !== 'queued' || task.scheduled) && <Button variant="ghost" size="icon-sm" className="delete-task-button" aria-label="删除任务" onClick={(event) => { event.stopPropagation(); setTaskToDelete(task); }}><Trash2 /></Button>}</div></td></tr>)}</tbody></table>{!loading && filteredTasks.length === 0 && <div className="empty-state"><Search size={20} /><span>{tasks.length ? '没有找到匹配的任务' : '还没有任务，点击“新建传输”开始'}</span></div>}{loading && <div className="empty-state"><LoaderCircle className="spin" /><span>正在读取任务...</span></div>}</div></section>
 
           <section className="nodes-section" id="nodes">
             <div className="section-title-row"><div><h2>传输节点</h2><span>{user.role === 'admin' ? '管理员可添加、测试和删除节点；普通用户可使用已配置节点' : '可使用的传输节点（节点由管理员统一维护）'}</span></div>{user.role === 'admin' && <AddNodesDialog onCreate={createNodes} />}</div>

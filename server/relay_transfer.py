@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import os
+import posixpath
 import re
 import shlex
 import signal
@@ -157,6 +158,31 @@ def format_data_size(value: int) -> str:
     return f"{amount:.1f} {unit}" if amount < 100 else f"{amount:.0f} {unit}"
 
 
+def managed_command(command: str, task_id: str) -> str:
+    """Give a node-side process group a task-specific cancellation handle."""
+    run_dir = shlex.quote(f"/tmp/.relay-run-{task_id}")
+    return (
+        f"run_dir={run_dir}; umask 077; mkdir -p \"$run_dir\"; "
+        "worker=''; cleanup() { "
+        "if [ -n \"$worker\" ]; then sudo -n /bin/kill -INT -- \"-$worker\" 2>/dev/null || true; "
+        "wait \"$worker\" 2>/dev/null || true; fi; rm -rf -- \"$run_dir\"; }; "
+        "trap cleanup EXIT; trap 'exit 130' HUP INT TERM; "
+        f"/usr/bin/setsid /bin/sh -c {shlex.quote('exec ' + command)} & worker=$!; "
+        "printf '%s\\n' \"$worker\" > \"$run_dir/pid\"; wait \"$worker\""
+    )
+
+
+def build_local_command(task: sqlite3.Row | dict[str, Any], *, verify: bool = False) -> str:
+    args = ["/usr/bin/rsync", "-rcln", "--out-format=%i %n%L"] if verify else [
+        "/usr/bin/rsync", "-rlt", "--partial-dir=.relay-partial-" + task["id"],
+        "--no-whole-file", "--info=progress2", "--outbuf=L",
+    ]
+    if task["bandwidth_limit_kbps"] and not verify:
+        args.append(f"--bwlimit={task['bandwidth_limit_kbps']}")
+    args.extend(["--", task["source_path"], task["destination_path"].rstrip("/") + "/"])
+    return "set -eu; " + managed_command("sudo -n /usr/bin/env LC_ALL=C " + shlex.join(args), task["id"])
+
+
 def build_remote_command(
     task: sqlite3.Row, destination: sqlite3.Row, known_hosts: str, private_key_length: int, *, verify: bool = False,
 ) -> str:
@@ -177,20 +203,23 @@ def build_remote_command(
         "/usr/bin/rsync", "-av", "--partial", "--partial-dir=.relay-partial",
         "--info=progress2", "--outbuf=L",
     ]
+    if not verify and "transfer_mode" in task.keys() and task["transfer_mode"]:
+        rsync_args[1] = "-rlt"
+        rsync_args[3] = "--partial-dir=.relay-partial-" + task_id
     if task["delete_enabled"] and not verify:
         rsync_args.append("--delete")
     if task["bandwidth_limit_kbps"] and not verify:
         rsync_args.append(f"--bwlimit={task['bandwidth_limit_kbps']}")
     rsync_args.extend([
         "-e", inner_ssh, "--", task["source_path"],
-        f"{destination['destination_user']}@{destination['destination_transfer_host']}:/",
+        f"{destination['destination_user']}@{'[' + destination['destination_transfer_host'] + ']' if ':' in destination['destination_transfer_host'] else destination['destination_transfer_host']}:/",
     ])
     quoted_rsync = " ".join(shlex.quote(argument) for argument in rsync_args)
     return (
         "set -eu; "
         f"known={shlex.quote(known_path)}; "
         f"key={shlex.quote(key_path)}; "
-        "trap 'rm -f \"$known\" \"$key\"' EXIT HUP INT TERM; "
+        "trap 'rm -f \"$known\" \"$key\"' EXIT; "
         "umask 077; "
         f"/usr/bin/head -c {private_key_length} > \"$key\"; "
         f"test \"$(/usr/bin/wc -c < \"$key\")\" -eq {private_key_length} || "
@@ -199,8 +228,7 @@ def build_remote_command(
         "chmod 600 \"$known\"; "
         f"sudo -n /usr/bin/test -e {shlex.quote(task['source_path'])} || "
         "{ printf '%s\\n' '源路径不存在或无权访问'; exit 66; }; "
-        "sudo -n /usr/bin/env LC_ALL=C "
-        f"{quoted_rsync}"
+        "( " + managed_command("sudo -n /usr/bin/env LC_ALL=C " + quoted_rsync, task_id) + " )"
     )
 
 
@@ -272,12 +300,44 @@ class TransferManager:
                 return False
             state["cancel"].set()
             process = state.get("process")
+            if state.get("task") and not state.get("stop_thread"):
+                stop_thread = threading.Thread(target=self._stop_and_record, args=(state["task"], state), daemon=True)
+                state["stop_thread"] = stop_thread
+                stop_thread.start()
         if process and process.poll() is None:
             try:
                 process.send_signal(signal.SIGINT)
             except ProcessLookupError:
                 pass
         return True
+
+    def _stop_and_record(self, task: sqlite3.Row, state: dict[str, Any]) -> None:
+        try:
+            self._stop_source(task)
+        except RuntimeError as exc:
+            state["stop_error"] = str(exc)
+
+    def _stop_source(self, task: sqlite3.Row) -> None:
+        pid_path = shlex.quote(f"/tmp/.relay-run-{task['id']}/pid")
+        run_dir = shlex.quote(f"/tmp/.relay-run-{task['id']}")
+        command = (
+            f"if test -f {pid_path}; then pid=$(cat {pid_path}); "
+            "case \"$pid\" in ''|*[!0-9]*) exit 1;; esac; "
+            "sudo -n /bin/kill -INT -- \"-$pid\" 2>/dev/null || true; "
+            "attempt=0; while sudo -n /bin/kill -0 -- \"-$pid\" 2>/dev/null; do "
+            "attempt=$((attempt + 1)); "
+            "if [ \"$attempt\" -eq 60 ]; then sudo -n /bin/kill -TERM -- \"-$pid\" 2>/dev/null || true; fi; "
+            "if [ \"$attempt\" -eq 100 ]; then sudo -n /bin/kill -KILL -- \"-$pid\" 2>/dev/null || true; fi; "
+            "if [ \"$attempt\" -gt 120 ]; then exit 1; fi; sleep 0.1; done; "
+            f"rm -f -- {pid_path}; rmdir -- {run_dir} 2>/dev/null || true; fi"
+        )
+        try:
+            result = subprocess.run(self._source_ssh_command(task, command), capture_output=True,
+                                    timeout=25, check=False, env=self._ssh_env(self._task_source_auth(task)))
+            if result.returncode:
+                raise RuntimeError("无法确认源节点上的复制已停止；恢复节点连接后点击重试")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("无法确认源节点上的复制已停止；恢复节点连接后点击重试") from exc
 
     def is_running(self, task_id: str) -> bool:
         with self.lock:
@@ -310,7 +370,7 @@ class TransferManager:
                 now = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 with self.connect() as db:
                     rows = db.execute(
-                        "SELECT id FROM tasks WHERE status = 'queued' AND schedule_at IS NOT NULL AND schedule_at <= ?",
+                        "SELECT id FROM tasks WHERE status = 'queued' AND (schedule_at IS NULL OR schedule_at <= ?)",
                         (now,),
                     ).fetchall()
                 for row in rows:
@@ -355,10 +415,14 @@ class TransferManager:
     def _paths_overlap(left: str, right: str) -> bool:
         left = left.rstrip("/") or "/"
         right = right.rstrip("/") or "/"
-        return left == right or left.startswith(f"{right}/") or right.startswith(f"{left}/")
+        return left == "/" or right == "/" or left == right or left.startswith(f"{right}/") or right.startswith(f"{left}/")
 
     def _acquire_destination_path(self, task_id: str, task: sqlite3.Row, cancel: threading.Event) -> bool:
-        destination = (str(task["destination_node_id"]), str(task["destination_path"]).rstrip("/") or "/")
+        destination = (str(task["destination_node_id"]), posixpath.normpath(str(task["destination_path"])))
+        with self.connect() as db:
+            uncertain = db.execute("SELECT destination_path FROM tasks WHERE destination_node_id = ? AND stop_reason = 'unconfirmed' AND id != ?", (destination[0], task_id)).fetchall()
+        if any(self._paths_overlap(destination[1], posixpath.normpath(row["destination_path"])) for row in uncertain):
+            raise RuntimeError("目标目录有尚未确认停止的任务，请先恢复该任务的节点连接并重试")
         with self.destination_condition:
             while not cancel.is_set():
                 conflict = any(
@@ -404,7 +468,7 @@ class TransferManager:
             try:
                 with self.db_write_lock:
                     with self.connect() as db:
-                        db.execute(f"UPDATE tasks SET {assignments} WHERE id = ?", (*values.values(), task_id))
+                        db.execute(f"UPDATE tasks SET {assignments} WHERE id = ? AND NOT (status = 'paused' AND stop_reason IS NOT NULL)", (*values.values(), task_id))
                         if values.get("status") in ("completed", "failed"):
                             task = db.execute("SELECT owner_id, name FROM tasks WHERE id = ?", (task_id,)).fetchone()
                             if task:
@@ -524,17 +588,37 @@ class TransferManager:
         if result.returncode != 0:
             raise RuntimeError((result.stderr.strip() or result.stdout.strip() or "无法读取源数据大小")[-500:])
         source_size, source_is_directory = self._parse_source_inspection(result.stdout)
-        self._check_destination_directory(destination, destination_path)
+        self._check_destination_directory(destination, destination_path, source_size)
         return source_size, source_is_directory
 
-    def _check_destination_directory(self, destination: sqlite3.Row, destination_path: str) -> None:
+    def check_local_paths(self, node: sqlite3.Row | dict[str, Any], source_path: str, destination_path: str) -> None:
+        """Resolve symlinks on the execution machine before checking copy overlap."""
+        target = posixpath.join(destination_path, posixpath.basename(source_path.rstrip("/")))
+        command = "set -eu; " + "; ".join(
+            "sudo -n /usr/bin/realpath -m -- " + shlex.quote(path)
+            for path in (source_path, destination_path, target)
+        )
+        result = subprocess.run(self._node_ssh_command(node, command), capture_output=True, text=True,
+                                timeout=25, check=False, env=self._ssh_env(node))
+        paths = result.stdout.strip().splitlines()
+        if result.returncode or len(paths) != 3:
+            raise RuntimeError("无法检查本机源路径和目标路径")
+        source, destination, target = paths
+        if self._paths_overlap(source, target) or destination == source or destination.startswith(source.rstrip("/") + "/"):
+            raise RuntimeError("源路径和最终目标路径不能相同或互相包含，请选择其他目标目录")
+
+    def _check_destination_directory(self, destination: sqlite3.Row, destination_path: str, required_bytes: int = 0) -> None:
         destination_quoted = shlex.quote(destination_path)
         destination_command = (
             "set -eu; "
             f"sudo -n /usr/bin/test -d {destination_quoted} || "
             "{ printf '%s\\n' '目标目录不存在或无权访问'; exit 67; }; "
             f"sudo -n /usr/bin/test -w {destination_quoted} || "
-            "{ printf '%s\\n' '目标目录不可写'; exit 67; }"
+            "{ printf '%s\\n' '目标目录不可写'; exit 67; }; "
+            "test -x /usr/bin/rsync || { printf '%s\\n' '目标节点未安装 rsync'; exit 69; }; "
+            f"available=$(df -B1 --output=avail -- {destination_quoted} | tail -n 1); "
+            f"test \"$available\" -ge {int(required_bytes)} || "
+            "{ printf '%s\\n' '目标可用空间不足以容纳本次复制及临时文件'; exit 68; }"
         )
         result = subprocess.run(
             self._node_ssh_command(destination, destination_command), capture_output=True, text=True,
@@ -637,6 +721,10 @@ class TransferManager:
             task = self._load_task(task_id)
             if not task:
                 raise RuntimeError("任务节点或 SSH 凭据不存在")
+            if task["status"] != "queued" or state["cancel"].is_set():
+                return
+            state["task"] = task
+            local = task["transfer_mode"] == "local"
             if not self._acquire_destination_path(task_id, task, state["cancel"]):
                 return
             destination_reserved = True
@@ -650,11 +738,17 @@ class TransferManager:
             if task["source_status"] != "online" or task["destination_status"] != "online":
                 raise RuntimeError("源节点和目标节点必须保持在线")
             source_size = self._measure_source_size(task)
+            if local:
+                self.check_local_paths({
+                    **self._task_source_auth(task), "ssh_port": task["source_port"],
+                    "username": task["source_user"], "host": task["source_host"],
+                }, task["source_path"], task["destination_path"])
             self._check_destination_directory({
                 **self._task_destination_auth(task), "ssh_port": task["destination_port"],
                 "username": task["destination_user"], "host": task["destination_host"],
-            }, task["destination_path"])
-            resume_base = min(max(0, task["progress_base_bytes"] or 0), source_size)
+            }, task["destination_path"], source_size)
+            # progress2 already includes matching/skipped bytes; adding the last run doubles progress.
+            resume_base = 0
             self._update(
                 task_id, total_bytes=source_size, transferred_bytes=resume_base,
                 progress=min(99, resume_base * 100 // source_size) if source_size else 0,
@@ -664,24 +758,32 @@ class TransferManager:
                 raise RuntimeError(
                     f"源数据大小 {format_data_size(source_size)} 超过任务上限 {format_data_size(max_size_bytes)}"
                 )
-            destination_hosts = _retarget_known_host_lines(_known_host_lines(
-                self.known_hosts_path, task["destination_host"], task["destination_port"]
-            ), task["destination_transfer_host"], task["destination_transfer_port"])
-            task_key_path, private_key, public_key = self._generate_task_key(task_id)
-            task_public_path = Path(f"{task_key_path}.pub")
-            self._authorize_destination(task, public_key)
-            authorized = True
-            remote_command = build_remote_command(task, task, destination_hosts, len(private_key))
+            if state["cancel"].is_set():
+                return
+            destination_hosts, private_key = "", b""
+            if local:
+                remote_command = build_local_command(task)
+            else:
+                destination_hosts = _retarget_known_host_lines(_known_host_lines(
+                    self.known_hosts_path, task["destination_host"], task["destination_port"]
+                ), task["destination_transfer_host"], task["destination_transfer_port"])
+                task_key_path, private_key, public_key = self._generate_task_key(task_id)
+                task_public_path = Path(f"{task_key_path}.pub")
+                self._authorize_destination(task, public_key)
+                authorized = True
+                remote_command = build_remote_command(task, task, destination_hosts, len(private_key))
             command = self._source_ssh_command(task, remote_command)
             self._update(
                 task_id, status="transferring", error_message=None, started_at=self.now(),
                 speed_bps=None, eta_seconds=None,
             )
-            process = subprocess.Popen(
-                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                env=self._ssh_env(self._task_source_auth(task)), bufsize=0,
-            )
             with self.lock:
+                if state["cancel"].is_set():
+                    return
+                process = subprocess.Popen(
+                    command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    env=self._ssh_env(self._task_source_auth(task)), bufsize=0,
+                )
                 state["process"] = process
             assert process.stdin is not None
             try:
@@ -774,7 +876,15 @@ class TransferManager:
                 except subprocess.TimeoutExpired:
                     process.kill()
             if authorized and task:
-                self._revoke_destination(task)
+                try:
+                    self._revoke_destination(task)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            if state.get("stop_thread"):
+                state["stop_thread"].join(timeout=26)
+            if state.get("stop_error"):
+                with self.connect() as db:
+                    db.execute("UPDATE tasks SET status = 'failed', stop_reason = 'unconfirmed', error_message = ?, updated_at = ? WHERE id = ?", (state["stop_error"], self.now(), task_id))
             if task_key_path:
                 task_key_path.unlink(missing_ok=True)
             if task_public_path:
@@ -794,13 +904,15 @@ class TransferManager:
     ) -> tuple[str | None, str]:
         """Run a read-only rsync checksum pass and return a concise difference report."""
         command = self._source_ssh_command(
-            task, build_remote_command(task, task, destination_hosts, len(private_key), verify=True),
-        )
-        process = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            env=self._ssh_env(self._task_source_auth(task)), bufsize=0,
+            task, build_local_command(task, verify=True) if task["transfer_mode"] == "local" else build_remote_command(task, task, destination_hosts, len(private_key), verify=True),
         )
         with self.lock:
+            if state["cancel"].is_set():
+                return None, ""
+            process = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                env=self._ssh_env(self._task_source_auth(task)), bufsize=0,
+            )
             state["process"] = process
         assert process.stdin is not None and process.stdout is not None
         try:

@@ -9,10 +9,119 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from relay_api import RelayApp, RelayServer
-from relay_transfer import build_remote_command, overall_progress, parse_progress_line
+from relay_transfer import build_local_command, build_remote_command, overall_progress, parse_progress_line
 
 
 class RelayApiTest(unittest.TestCase):
+    def seed_mode_nodes(self):
+        status, _ = self.request("POST", "/relay/api/setup", {
+            "username": "admin", "display_name": "Test", "password": "test-only-long-password",
+        })
+        self.assertEqual(status, 201)
+        with self.server.app.connect() as db:
+            db.execute("INSERT INTO credentials(id,name,fingerprint,key_path,created_at,owner_id) VALUES ('test-key','test','test','/tmp/test-only-key','2026-01-01',1)")
+            for index in (1, 2):
+                db.execute("INSERT INTO nodes(id,name,status,host,ssh_port,username,credential_id,created_at) VALUES (?,?,'online',?,2222,'test','test-key','2026-01-01')", (f"node-{index}", f"Node {index}", f"127.0.0.{index}"))
+        self.server.app.transfers.preflight = Mock(return_value=(1024, True))
+        self.server.app.transfers.check_local_paths = Mock()
+        return {"source_node_id": "node-1", "destination_node_id": "node-2", "source_path": "/data/source/", "destination_path": "/archive/"}
+
+    def test_explicit_modes_and_legacy_compatibility(self):
+        body = self.seed_mode_nodes()
+        for mode, additions in (("public", {}), ("private", {"direct_host": "10.0.0.2"}), ("local", {"destination_node_id": "node-1"})):
+            status, result = self.request("POST", "/relay/api/tasks", {**body, "transfer_mode": mode, **additions})
+            self.assertEqual(status, 201, result)
+            task = result["task"]
+            self.assertEqual(task["transfer_mode"], mode)
+            self.assertEqual(task["source_path"], "/data/source")
+            self.assertEqual(task["direct_port"], 22 if mode == "private" else None)
+        self.server.app.transfers.check_local_paths.assert_called_once()
+        status, result = self.request("POST", "/relay/api/tasks", {**body, "direct_host": "10.0.0.2"})
+        self.assertEqual(status, 201)
+        self.assertEqual(result["task"]["transfer_mode"], "legacy")
+        self.assertEqual(result["task"]["source_path"], "/data/source/")
+        self.assertEqual(result["task"]["direct_port"], 2222)
+
+    def test_modes_reject_mixed_endpoints_and_deletion(self):
+        body = self.seed_mode_nodes()
+        cases = [
+            {"transfer_mode": "auto"},
+            {"transfer_mode": "private"},
+            {"transfer_mode": "private", "direct_host": "some-node"},
+            {"transfer_mode": "private", "direct_host": "10.0.0.2", "direct_port": 65536},
+            {"transfer_mode": "public", "direct_host": "10.0.0.2"},
+            {"transfer_mode": "public", "destination_node_id": "node-1"},
+            {"transfer_mode": "local"},
+            {"transfer_mode": "local", "destination_node_id": "node-1", "direct_port": 22},
+            {"transfer_mode": "local", "destination_node_id": "node-1", "delete_enabled": True},
+        ]
+        for extra in cases:
+            with self.subTest(extra=extra):
+                status, result = self.request("POST", "/relay/api/tasks", {**body, **extra})
+                self.assertEqual(status, 400, result)
+        self.server.app.transfers.preflight.assert_not_called()
+
+    def test_cancel_and_retry_preserve_mode_and_do_not_restart_live_worker(self):
+        body = self.seed_mode_nodes()
+        status, result = self.request("POST", "/relay/api/tasks", {**body, "transfer_mode": "local", "destination_node_id": "node-1"})
+        self.assertEqual(status, 201, result)
+        task_id = result["task"]["id"]
+        manager = self.server.app.transfers
+        manager.runs[task_id] = {"cancel": threading.Event(), "process": None}
+        status, result = self.request("POST", f"/relay/api/tasks/{task_id}/cancel", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(result["task"]["status"], "cancelling")
+        manager._update(task_id, status="completed", progress=100)
+        status, _ = self.request("POST", f"/relay/api/tasks/{task_id}/retry", {})
+        self.assertEqual(status, 400)
+        manager.runs.clear()
+        _, listing = self.request("GET", "/relay/api/tasks")
+        self.assertEqual(listing["tasks"][0]["status"], "cancelled")
+        status, result = self.request("POST", f"/relay/api/tasks/{task_id}/retry", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(result["task"]["status"], "queued")
+        self.assertEqual(result["task"]["transfer_mode"], "local")
+
+    def test_local_path_checks_resolve_symlinks_and_final_filename(self):
+        manager = self.server.app.transfers
+        node = {"key_path": "/test-key", "ssh_port": 22, "username": "test", "host": "127.0.0.1"}
+        for output in ("/data/src\n/data/src/sub\n/data/src/sub/src\n", "/data/file\n/data\n/data/file\n", "/data/src\n/alias\n/data/src\n"):
+            with patch("relay_transfer.subprocess.run", return_value=Mock(returncode=0, stdout=output)):
+                with self.assertRaisesRegex(RuntimeError, "不能相同或互相包含"):
+                    manager.check_local_paths(node, "/data/src", "/alias")
+        with patch("relay_transfer.subprocess.run", return_value=Mock(returncode=0, stdout="/data/src\n/archive\n/archive/src\n")):
+            manager.check_local_paths(node, "/data/src", "/archive")
+
+    def test_unconfirmed_stop_blocks_deletion_and_unsafe_retry(self):
+        body = self.seed_mode_nodes()
+        _, result = self.request("POST", "/relay/api/tasks", {**body, "transfer_mode": "local", "destination_node_id": "node-1"})
+        task_id = result["task"]["id"]
+        with self.server.app.connect() as db:
+            db.execute("UPDATE tasks SET status='failed',stop_reason='unconfirmed' WHERE id=?", (task_id,))
+        manager = self.server.app.transfers
+        with patch.object(manager, "_stop_source", side_effect=RuntimeError("停止尚未确认")):
+            status, _ = self.request("POST", f"/relay/api/tasks/{task_id}/retry", {})
+            self.assertEqual(status, 400)
+        status, _ = self.request("DELETE", f"/relay/api/tasks/{task_id}")
+        self.assertEqual(status, 400)
+        with self.assertRaisesRegex(RuntimeError, "尚未确认停止"):
+            manager._acquire_destination_path("other-task", {"destination_node_id": "node-1", "destination_path": "/archive/sub"}, threading.Event())
+        with patch.object(manager, "_stop_source"):
+            status, result = self.request("POST", f"/relay/api/tasks/{task_id}/retry", {})
+            self.assertEqual(status, 200)
+            self.assertEqual(result["task"]["status"], "queued")
+
+    def test_local_command_supports_partial_reuse_and_read_only_verification(self):
+        task = {"id": "test-mode", "source_path": "/data/source space", "destination_path": "/archive/", "bandwidth_limit_kbps": 1024}
+        command = build_local_command(task)
+        self.assertIn("--no-whole-file", command)
+        self.assertIn("--partial-dir=.relay-partial-test-mode", command)
+        self.assertNotIn("--delete", command)
+        self.assertNotIn("/usr/bin/ssh", command)
+        verify = build_local_command(task, verify=True)
+        self.assertIn("-rcln", verify)
+        self.assertNotIn("--bwlimit", verify)
+
     def test_shutdown_rejects_new_transfers(self):
         manager = self.server.app.transfers
         self.assertTrue(manager.shutdown(timeout=0))
@@ -279,6 +388,7 @@ class RelayApiTest(unittest.TestCase):
     def test_transfer_destination_check_preserves_password_auth(self):
         manager = self.server.app.transfers
         task = {
+            "status": "queued", "transfer_mode": "public",
             "source_node_id": "source", "destination_node_id": "destination",
             "source_status": "online", "destination_status": "online",
             "destination_auth_type": "password", "destination_password_path": "/test/password",

@@ -778,3 +778,14 @@ body { font-size: 15px; }
   .users-dialog [data-slot=dialog-footer] button { height: 40px; min-width: 0; border-radius: 9px; font-size: 13px; }
   .users-dialog [data-slot=dialog-close] { top: 15px; right: 12px; }
 }
+
+/* Explicit transfer modes share the existing dialog layout. */
+.direct-transfer-dialog [data-slot=dialog-header] { flex: 0 0 auto; }
+.direct-transfer-dialog .form-stack { flex: 1 1 auto; }
+.transfer-route { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-areas: "source-node destination-node" "source-path destination-path"; }
+.local-transfer-route { grid-template-areas: "source-node source-node" "source-path destination-path"; }
+.path-hint strong { overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  .transfer-route { grid-template-columns: 1fr; grid-template-areas: "source-node" "destination-node" "source-path" "destination-path"; }
+  .local-transfer-route { grid-template-areas: "source-node" "source-path" "destination-path"; }
+}

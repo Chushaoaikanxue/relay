@@ -9,6 +9,7 @@ import base64
 import ipaddress
 import json
 import os
+import posixpath
 import re
 import secrets
 import signal
@@ -40,7 +41,7 @@ DEFAULT_MAX_TRANSFERS_PER_NODE = 2
 MAX_CONCURRENT_TRANSFERS = 16
 MAX_TRANSFERS_PER_NODE = 8
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
-TASK_ACTION_PATTERN = re.compile(r"^/relay/api/tasks/([0-9a-f-]{36})/(pause|resume|retry)$")
+TASK_ACTION_PATTERN = re.compile(r"^/relay/api/tasks/([0-9a-f-]{36})/(pause|resume|retry|cancel)$")
 TASK_PATTERN = re.compile(r"^/relay/api/tasks/([0-9a-f-]{36})$")
 NODE_ACTION_PATTERN = re.compile(r"^/relay/api/nodes/([0-9a-f-]{36})/(test|transfer-route)$")
 NODE_PATTERN = re.compile(r"^/relay/api/nodes/([0-9a-f-]{36})$")
@@ -72,7 +73,7 @@ def clean_path(value: Any, *, field: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field}格式不正确")
     value = value.strip()
-    if not value.startswith("/") or value == "/" or len(value) > 2048:
+    if not value.startswith("/") or posixpath.normpath(value) == "/" or len(value) > 2048:
         raise ValueError(f"{field}必须是非根目录的绝对路径")
     if any(ord(character) < 32 for character in value) or any(character in value for character in "\\\"'"):
         raise ValueError(f"{field}包含不支持的字符")
@@ -292,6 +293,8 @@ class RelayApp:
             self.ensure_column(db, "tasks", "schedule_at", "TEXT")
             self.ensure_column(db, "tasks", "progress_base_bytes", "INTEGER NOT NULL DEFAULT 0")
             self.ensure_column(db, "tasks", "direct_host", "TEXT")
+            self.ensure_column(db, "tasks", "transfer_mode", "TEXT")
+            self.ensure_column(db, "tasks", "stop_reason", "TEXT")
             self.ensure_column(db, "tasks", "direct_port", "INTEGER")
             self.ensure_column(db, "tasks", "verify_after_transfer", "INTEGER NOT NULL DEFAULT 0")
             self.ensure_column(db, "tasks", "verification_status", "TEXT")
@@ -531,12 +534,17 @@ def human_duration(seconds: int | None, fallback: str) -> str:
     return f"{hours}h {minutes}m" if hours else f"{minutes}m"
 
 
-def task_to_json(row: sqlite3.Row) -> dict[str, Any]:
-    status = row["status"]
+def task_to_json(row: sqlite3.Row, *, running: bool = False) -> dict[str, Any]:
+    status = "cancelled" if row["status"] == "paused" and row["stop_reason"] == "cancel" else row["status"]
+    if row["status"] == "paused" and running:
+        status = "cancelling" if row["stop_reason"] == "cancel" else "pausing"
     verification_status = row["verification_status"]
     eta_fallback = {
         "queued": "等待执行",
         "paused": "已暂停",
+        "cancelled": "已取消",
+        "cancelling": "取消中",
+        "pausing": "暂停中",
         "failed": row["error_message"] or "执行失败",
         "completed": "完成",
         "transferring": "计算中",
@@ -580,6 +588,7 @@ def task_to_json(row: sqlite3.Row) -> dict[str, Any]:
         "source_path": row["source_path"],
         "destination_path": row["destination_path"],
         "direct_host": row["direct_host"],
+        "transfer_mode": row["transfer_mode"] or ("legacy" if row["direct_host"] else "public"),
         "direct_port": row["direct_port"],
         "delete_enabled": bool(row["delete_enabled"]),
         "bandwidth_limit_kbps": row["bandwidth_limit_kbps"],
@@ -728,7 +737,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     """,
                     params,
                 ).fetchall()
-            self._json(HTTPStatus.OK, {"tasks": [task_to_json(row) for row in rows]})
+            self._json(HTTPStatus.OK, {"tasks": [task_to_json(row, running=self.server.app.transfers.is_running(row["id"])) for row in rows]})
             return
         if path == f"{API_PREFIX}/transfer-settings":
             self._json(HTTPStatus.OK, self.server.app.transfer_settings())
@@ -1002,21 +1011,42 @@ class RelayHandler(BaseHTTPRequestHandler):
         payload = self._read_json()
         name = clean_text(payload.get("name", "新传输任务"), field="任务名称", maximum=120, required=False) or "新传输任务"
         source_node_id = clean_text(payload.get("source_node_id"), field="源节点", maximum=36)
-        destination_node_id = clean_text(payload.get("destination_node_id"), field="目标节点", maximum=36)
-        if source_node_id == destination_node_id:
+        transfer_mode = payload.get("transfer_mode")
+        if transfer_mode is not None and transfer_mode not in ("public", "private", "local"):
+            raise ValueError("请选择公网传输、内网传输或同节点传输")
+        destination_node_id = clean_text(payload.get("destination_node_id", source_node_id if transfer_mode == "local" else None), field="目标节点", maximum=36)
+        if transfer_mode == "local" and source_node_id != destination_node_id:
+            raise ValueError("同节点传输只需选择一个执行节点")
+        if transfer_mode != "local" and source_node_id == destination_node_id:
             raise ValueError("源节点和目标节点不能相同")
         source_path = clean_path(payload.get("source_path"), field="源路径")
         destination_path = clean_path(payload.get("destination_path"), field="目标路径")
+        if transfer_mode is not None:
+            # New tasks always copy the named directory, independent of a trailing slash.
+            source_path = posixpath.normpath(source_path)
+            destination_path = posixpath.normpath(destination_path)
         direct_host_value = payload.get("direct_host", "")
         if not isinstance(direct_host_value, str):
             raise ValueError("本次直传地址格式不正确")
         direct_host = self.server.app.validate_host(direct_host_value.strip()) if direct_host_value.strip() else None
         direct_port_value = payload.get("direct_port")
+        if transfer_mode in ("public", "local"):
+            if direct_host or direct_port_value not in (None, ""):
+                raise ValueError("当前传输方式不接受手动目标地址或端口")
+        if transfer_mode == "private":
+            if not direct_host:
+                raise ValueError("请填写目标内网 IP")
+            try:
+                ipaddress.ip_address(direct_host)
+            except ValueError as exc:
+                raise ValueError("目标内网地址必须是有效的 IP") from exc
         if direct_host is None and direct_port_value not in (None, ""):
             raise ValueError("填写直传端口时必须同时填写直传地址")
         delete_enabled = payload.get("delete_enabled", False)
         if not isinstance(delete_enabled, bool):
             raise ValueError("删除目标多余文件选项格式不正确")
+        if transfer_mode is not None and delete_enabled:
+            raise ValueError("新传输任务仅支持复制，不删除目标独有文件")
         verify_after_transfer = payload.get("verify_after_transfer", False)
         if not isinstance(verify_after_transfer, bool):
             raise ValueError("内容校验选项格式不正确")
@@ -1062,7 +1092,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         if direct_host is None:
             direct_port = None
         elif direct_port_value in (None, ""):
-            direct_port = by_id[destination_node_id]["ssh_port"]
+            direct_port = 22 if transfer_mode == "private" else by_id[destination_node_id]["ssh_port"]
         else:
             try:
                 direct_port = int(direct_port_value)
@@ -1071,6 +1101,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             if not 1 <= direct_port <= 65535:
                 raise ValueError("本次直传端口必须在 1 到 65535 之间")
         try:
+            if transfer_mode == "local":
+                self.server.app.transfers.check_local_paths(by_id[source_node_id], source_path, destination_path)
             total_bytes, source_is_directory = self.server.app.transfers.preflight(
                 by_id[source_node_id], source_path, by_id[destination_node_id], destination_path,
             )
@@ -1091,14 +1123,14 @@ class RelayHandler(BaseHTTPRequestHandler):
                     id, name, source, destination, status, progress, created_at, updated_at, owner_id,
                     source_node_id, destination_node_id, source_path, destination_path,
                     delete_enabled, bandwidth_limit_kbps, max_size_bytes, total_bytes, schedule_at,
-                    direct_host, direct_port, verify_after_transfer
+                    direct_host, direct_port, verify_after_transfer, transfer_mode
                 )
-                VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id, name, source, destination, now, now, user["id"], source_node_id,
                     destination_node_id, source_path, destination_path, int(delete_enabled), bandwidth_kbps,
-                    max_size_bytes, total_bytes, schedule_at, direct_host, direct_port, int(verify_after_transfer),
+                    max_size_bytes, total_bytes, schedule_at, direct_host, direct_port, int(verify_after_transfer), transfer_mode,
                 ),
             )
             row = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -1140,30 +1172,43 @@ class RelayHandler(BaseHTTPRequestHandler):
             row = db.execute(f"SELECT * FROM tasks WHERE id = ?{scope}", params).fetchone()
             if not row:
                 raise ValueError("任务不存在")
-            if action == "pause":
-                if row["status"] not in ("queued", "transferring"):
+            if action in ("pause", "cancel"):
+                if row["status"] not in (("queued", "transferring", "paused") if action == "cancel" else ("queued", "transferring")):
                     raise ValueError("当前任务不能暂停")
-                self.server.app.transfers.cancel(task_id)
                 db.execute(
-                    "UPDATE tasks SET status = 'paused', progress_base_bytes = transferred_bytes, speed_bps = 0, eta_seconds = NULL, error_message = NULL, updated_at = ? WHERE id = ?",
-                    (iso_now(), task_id),
+                    "UPDATE tasks SET status = 'paused', stop_reason = ?, progress_base_bytes = transferred_bytes, speed_bps = 0, eta_seconds = NULL, error_message = NULL, updated_at = ? WHERE id = ?",
+                    (action, iso_now(), task_id),
                 )
             else:
-                allowed = ("paused",) if action == "resume" else ("failed", "completed")
+                if self.server.app.transfers.is_running(task_id):
+                    raise ValueError("任务正在停止，请稍后重试")
+                if row["stop_reason"] == "unconfirmed":
+                    task = self.server.app.transfers._load_task(task_id)
+                    if task is None:
+                        raise ValueError("请先恢复任务的节点及凭据配置")
+                    try:
+                        self.server.app.transfers._stop_source(task)
+                    except RuntimeError as exc:
+                        raise ValueError(str(exc)) from exc
+                allowed = ("paused",) if action == "resume" else ("failed", "completed", "paused")
                 if row["status"] not in allowed:
                     raise ValueError("当前任务不能重新执行")
+                if action == "resume" and row["stop_reason"] == "cancel":
+                    raise ValueError("已取消任务请使用重试")
                 if not row["source_node_id"] or not row["destination_node_id"]:
                     raise ValueError("旧任务没有节点配置，请重新创建")
                 db.execute(
-                    "UPDATE tasks SET status = 'queued', error_message = NULL, speed_bps = NULL, eta_seconds = NULL, completed_at = NULL, verification_status = NULL, verification_message = NULL, schedule_at = CASE WHEN ? = 'retry' THEN NULL ELSE schedule_at END, progress_base_bytes = CASE WHEN ? = 'retry' THEN 0 ELSE progress_base_bytes END, transferred_bytes = CASE WHEN ? = 'retry' THEN 0 ELSE transferred_bytes END, progress = CASE WHEN ? = 'retry' THEN 0 ELSE progress END, updated_at = ? WHERE id = ?",
+                    "UPDATE tasks SET status = 'queued', stop_reason = NULL, error_message = NULL, speed_bps = NULL, eta_seconds = NULL, completed_at = NULL, verification_status = NULL, verification_message = NULL, schedule_at = CASE WHEN ? = 'retry' THEN NULL ELSE schedule_at END, progress_base_bytes = CASE WHEN ? = 'retry' THEN 0 ELSE progress_base_bytes END, transferred_bytes = CASE WHEN ? = 'retry' THEN 0 ELSE transferred_bytes END, progress = CASE WHEN ? = 'retry' THEN 0 ELSE progress END, updated_at = ? WHERE id = ?",
                     (action, action, action, action, iso_now(), task_id),
                 )
             updated = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         scheduled_for_later = bool(updated["schedule_at"] and updated["schedule_at"] > iso_now())
-        if action != "pause" and not scheduled_for_later and not self.server.app.transfers.start(task_id):
+        if action in ("pause", "cancel"):
+            self.server.app.transfers.cancel(task_id)
+        if action not in ("pause", "cancel") and not scheduled_for_later and not self.server.app.transfers.start(task_id):
             raise ValueError("任务正在停止，请稍后重试")
         self.server.app.audit(user["id"], action, "task", task_id, f"对任务执行 {action}")
-        self._json(HTTPStatus.OK, {"task": task_to_json(updated)})
+        self._json(HTTPStatus.OK, {"task": task_to_json(updated, running=self.server.app.transfers.is_running(task_id))})
 
     def _handle_create_nodes(self, user: sqlite3.Row) -> None:
         payload = self._read_json()
@@ -1313,11 +1358,13 @@ class RelayHandler(BaseHTTPRequestHandler):
         with self.server.app.connect() as db:
             scope = "" if self._is_admin(user) else " AND owner_id = ?"
             params: tuple[Any, ...] = (task_id,) if self._is_admin(user) else (task_id, user["id"])
-            task = db.execute(f"SELECT id, name, status, schedule_at FROM tasks WHERE id = ?{scope}", params).fetchone()
+            task = db.execute(f"SELECT id, name, status, schedule_at, stop_reason FROM tasks WHERE id = ?{scope}", params).fetchone()
             if not task:
                 raise ValueError("任务不存在")
             if task["status"] == "transferring":
                 raise ValueError("任务正在传输，请先暂停后再删除")
+            if task["stop_reason"] == "unconfirmed":
+                raise ValueError("尚未确认远端复制停止，请恢复节点连接并重试后再删除")
             is_scheduled = bool(task["schedule_at"] and task["schedule_at"] > iso_now())
             if task["status"] == "queued" and not is_scheduled:
                 raise ValueError("任务正在启动，请先暂停后再删除")
@@ -1343,7 +1390,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             active_task = db.execute(
                 """
                 SELECT 1 FROM tasks
-                WHERE status IN ('queued', 'transferring')
+                WHERE (status IN ('queued', 'transferring') OR stop_reason = 'unconfirmed')
                   AND (source_node_id = ? OR destination_node_id = ?)
                 LIMIT 1
                 """,
@@ -1351,6 +1398,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             ).fetchone()
             if active_task:
                 raise ValueError("该节点有正在执行或等待执行的任务，不能删除")
+            stopping = db.execute("SELECT id FROM tasks WHERE status = 'paused' AND (source_node_id = ? OR destination_node_id = ?)", (node_id, node_id)).fetchall()
+            if any(self.server.app.transfers.is_running(task["id"]) for task in stopping):
+                raise ValueError("该节点仍有任务正在停止，请稍后重试")
             db.execute("UPDATE tasks SET source_node_id = NULL WHERE source_node_id = ?", (node_id,))
             db.execute("UPDATE tasks SET destination_node_id = NULL WHERE destination_node_id = ?", (node_id,))
             db.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
